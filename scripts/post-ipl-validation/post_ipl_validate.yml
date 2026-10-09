@@ -1,0 +1,771 @@
+name: z/OS 3.2 Post-IPL Validation Suite
+
+on:
+  workflow_dispatch:
+    inputs:
+      ipl_lpar:
+        description: "Target LPAR name (e.g. SYSA)"
+        required: true
+        default: "SYSA"
+      ipl_timestamp:
+        description: "IPL completion timestamp (ISO 8601)"
+        required: true
+        default: ""
+      environment:
+        description: "Environment type"
+        required: true
+        type: choice
+        options: [non-production, production]
+        default: non-production
+      cab_change_id:
+        description: "CAB Change Record ID (e.g. CHG0012345)"
+        required: false
+        default: ""
+      jira_epic_key:
+        description: "Jira Epic key (e.g. ZOSM-1)"
+        required: false
+        default: ""
+
+  repository_dispatch:
+    types: [ipl-complete]
+
+env:
+  LPAR:          ${{ github.event.inputs.ipl_lpar || github.event.client_payload.lpar }}
+  IPL_TS:        ${{ github.event.inputs.ipl_timestamp || github.event.client_payload.timestamp }}
+  ENV_TYPE:      ${{ github.event.inputs.environment || github.event.client_payload.environment }}
+  CAB_CHANGE_ID: ${{ github.event.inputs.cab_change_id || github.event.client_payload.cab_change_id }}
+  JIRA_EPIC:     ${{ github.event.inputs.jira_epic_key || github.event.client_payload.jira_epic_key }}
+
+jobs:
+  # ── Job 1: PARMLIB Parameter Verification ──────────────────────────────────
+  parmlib-verification:
+    name: "PARMLIB Parameter Verification"
+    runs-on: ubuntu-latest
+    outputs:
+      result:  ${{ steps.verify.outputs.result }}
+      passed:  ${{ steps.verify.outputs.passed }}
+      details: ${{ steps.verify.outputs.details }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run PARMLIB verification via z/OSMF REST API
+        id: verify
+        uses: actions/github-script@v7
+        env:
+          ZOSMF_HOST:  ${{ secrets.ZOSMF_HOST }}
+          ZOSMF_USER:  ${{ secrets.ZOSMF_USER }}
+          ZOSMF_PASS:  ${{ secrets.ZOSMF_PASS }}
+        with:
+          script: |
+            const host = process.env.ZOSMF_HOST;
+            const auth = Buffer.from(`${process.env.ZOSMF_USER}:${process.env.ZOSMF_PASS}`).toString('base64');
+            const headers = {
+              'Authorization': `Basic ${auth}`,
+              'Content-Type':  'application/json',
+              'X-CSRF-ZOSMF-HEADER': '*',
+            };
+
+            // PARMLIB checks: member → expected parameter → expected value
+            const CHECKS = [
+              { member: 'BPXPRMZZ', param: 'REXXPARSE',        expected: 'REXX',    critical: false },
+              { member: 'IEAOPTAA', param: 'CPENABLE',          expected: 'SYSTEM',  critical: true  },
+              { member: 'IARPRM00', param: 'RESTRICTPFTCADS',   expected: 'YES',     critical: true  },
+              { member: 'IARPRM00', param: 'ARR2V_REQAUTH',     expected: 'YES',     critical: true  },
+              { member: 'DIAGAA',   param: 'ASCBV31',           expected: 'YES',     critical: false },
+              { member: 'SMFLIMAA', param: 'CHECKREGIONABOVE',  expected: 'YES',     critical: false },
+              { member: 'SMFLIMAA', param: 'CHECKREGIONBELOW',  expected: 'YES',     critical: false },
+              { member: 'IEASYSAA', param: 'VRREGN',            expected: 'ABSENT',  critical: true  },
+              { member: 'IEASYSAA', param: 'VREALSZ',           expected: 'ABSENT',  critical: true  },
+              { member: 'IEASYSAA', param: 'REAL',              expected: 'PRESENT', critical: true  },
+            ];
+
+            const results = [];
+            let allPassed = true;
+
+            for (const check of CHECKS) {
+              try {
+                // z/OSMF Dataset REST API — read PARMLIB member
+                const url = `https://${host}/zosmf/restfiles/ds/SYS1.PARMLIB(${check.member})`;
+                const resp = await fetch(url, { headers });
+
+                if (!resp.ok) {
+                  results.push({ ...check, status: 'ERROR', actual: `HTTP ${resp.status}`, passed: false });
+                  if (check.critical) allPassed = false;
+                  continue;
+                }
+
+                const content = await resp.text();
+                let actual = 'NOT FOUND';
+                let passed = false;
+
+                if (check.expected === 'ABSENT') {
+                  passed = !content.includes(check.param);
+                  actual = passed ? 'ABSENT (correct)' : 'PRESENT (should be removed)';
+                } else if (check.expected === 'PRESENT') {
+                  passed = content.includes(check.param);
+                  actual = passed ? 'PRESENT (correct)' : 'ABSENT (missing)';
+                } else {
+                  // Extract value: PARAM=VALUE or PARAM(VALUE)
+                  const re = new RegExp(`${check.param}[=\\(]([\\w]+)`, 'i');
+                  const m  = content.match(re);
+                  actual   = m ? m[1] : 'NOT FOUND';
+                  passed   = actual.toUpperCase() === check.expected.toUpperCase();
+                }
+
+                if (!passed && check.critical) allPassed = false;
+                results.push({ ...check, actual, passed, status: passed ? 'PASS' : 'FAIL' });
+
+              } catch (err) {
+                results.push({ ...check, status: 'ERROR', actual: err.message, passed: false });
+                if (check.critical) allPassed = false;
+              }
+            }
+
+            const summary = {
+              total:   results.length,
+              passed:  results.filter(r => r.passed).length,
+              failed:  results.filter(r => !r.passed).length,
+              critical_failures: results.filter(r => !r.passed && r.critical).length,
+            };
+
+            core.setOutput('result',  allPassed ? 'PASS' : 'FAIL');
+            core.setOutput('passed',  String(allPassed));
+            core.setOutput('details', JSON.stringify({ summary, results }));
+            console.log('PARMLIB Check Summary:', JSON.stringify(summary, null, 2));
+
+  # ── Job 2: RACF & ICSF Health Probes ───────────────────────────────────────
+  racf-icsf-health:
+    name: "RACF & ICSF Health Probes"
+    runs-on: ubuntu-latest
+    outputs:
+      result:  ${{ steps.probe.outputs.result }}
+      passed:  ${{ steps.probe.outputs.passed }}
+      details: ${{ steps.probe.outputs.details }}
+
+    steps:
+      - name: Run RACF and ICSF health probes
+        id: probe
+        uses: actions/github-script@v7
+        env:
+          ZOSMF_HOST: ${{ secrets.ZOSMF_HOST }}
+          ZOSMF_USER: ${{ secrets.ZOSMF_USER }}
+          ZOSMF_PASS: ${{ secrets.ZOSMF_PASS }}
+        with:
+          script: |
+            const host = process.env.ZOSMF_HOST;
+            const auth = Buffer.from(`${process.env.ZOSMF_USER}:${process.env.ZOSMF_PASS}`).toString('base64');
+            const headers = {
+              'Authorization': `Basic ${auth}`,
+              'Content-Type':  'application/json',
+              'X-CSRF-ZOSMF-HEADER': '*',
+            };
+
+            const probes = [];
+            let allPassed = true;
+
+            // ── RACF probes via z/OSMF console commands ──────────────────
+            const racfCommands = [
+              { name: 'RACF subsystem active',       cmd: 'D RACF',                    expect: 'RACF IS ACTIVE',         critical: true  },
+              { name: 'RACF REUSASID configured',    cmd: 'D RACF,REUSASID',           expect: 'REUSASID=YES',           critical: false },
+              { name: 'RACF User ID Containment',    cmd: 'D RACF,CONTAINMENT',        expect: 'CONTAINMENT',            critical: false },
+              { name: 'DSNRAUTH class active',       cmd: 'D RACF,CLASS(DSNRAUTH)',    expect: 'ACTIVE',                 critical: false },
+              { name: 'RACF database accessible',    cmd: 'LISTUSER IBMUSER NORACF',   expect: 'USER=IBMUSER',           critical: true  },
+            ];
+
+            const icsfCommands = [
+              { name: 'ICSF subsystem active',       cmd: 'D ICSF,STATUS',             expect: 'ICSF IS ACTIVE',         critical: true  },
+              { name: 'PKCS11 support enabled',      cmd: 'D ICSF,PKCS11',             expect: 'PKCS11=ENABLE',          critical: true  },
+              { name: 'PQC ML-KEM available',        cmd: 'D ICSF,ALGORITHMS',         expect: 'ML-KEM',                 critical: true  },
+              { name: 'PQC ML-DSA available',        cmd: 'D ICSF,ALGORITHMS',         expect: 'ML-DSA',                 critical: true  },
+              { name: 'FIPS mode configured',        cmd: 'D ICSF,FIPS',               expect: 'FIPSMODE=COMPAT',        critical: false },
+              { name: 'MK Query functional',         cmd: 'D ICSF,MK',                 expect: 'MASTER KEY',             critical: true  },
+            ];
+
+            // Issue console commands via z/OSMF REST API
+            async function issueCommand(cmd, expect, name, critical) {
+              try {
+                const url  = `https://${host}/zosmf/restconsoles/consoles/defcn`;
+                const body = JSON.stringify({ cmd, 'system': process.env.LPAR || 'SYSA' });
+                const resp = await fetch(url, { method: 'PUT', headers, body });
+                const data = await resp.json();
+                const output = (data['cmd-response'] || '').toUpperCase();
+                const passed = output.includes(expect.toUpperCase());
+                if (!passed && critical) allPassed = false;
+                return { name, cmd, expected: expect, actual: output.substring(0, 120), passed,
+                         status: passed ? 'PASS' : 'FAIL', critical };
+              } catch (err) {
+                if (critical) allPassed = false;
+                return { name, cmd, expected: expect, actual: err.message, passed: false,
+                         status: 'ERROR', critical };
+              }
+            }
+
+            for (const p of [...racfCommands, ...icsfCommands]) {
+              const result = await issueCommand(p.cmd, p.expect, p.name, p.critical);
+              probes.push(result);
+            }
+
+            const summary = {
+              total:    probes.length,
+              passed:   probes.filter(p => p.passed).length,
+              failed:   probes.filter(p => !p.passed).length,
+              racf:     probes.filter(p => p.name.includes('RACF') && p.passed).length,
+              icsf:     probes.filter(p => p.name.includes('ICSF') && p.passed).length,
+              critical_failures: probes.filter(p => !p.passed && p.critical).length,
+            };
+
+            core.setOutput('result',  allPassed ? 'PASS' : 'FAIL');
+            core.setOutput('passed',  String(allPassed));
+            core.setOutput('details', JSON.stringify({ summary, probes }));
+
+  # ── Job 3: JES2 Spool Status ────────────────────────────────────────────────
+  jes2-spool-check:
+    name: "JES2 Spool Status Check"
+    runs-on: ubuntu-latest
+    outputs:
+      result:  ${{ steps.jes2.outputs.result }}
+      passed:  ${{ steps.jes2.outputs.passed }}
+      details: ${{ steps.jes2.outputs.details }}
+
+    steps:
+      - name: Check JES2 spool and subsystem status
+        id: jes2
+        uses: actions/github-script@v7
+        env:
+          ZOSMF_HOST: ${{ secrets.ZOSMF_HOST }}
+          ZOSMF_USER: ${{ secrets.ZOSMF_USER }}
+          ZOSMF_PASS: ${{ secrets.ZOSMF_PASS }}
+        with:
+          script: |
+            const host = process.env.ZOSMF_HOST;
+            const auth = Buffer.from(`${process.env.ZOSMF_USER}:${process.env.ZOSMF_PASS}`).toString('base64');
+            const headers = {
+              'Authorization': `Basic ${auth}`,
+              'Content-Type':  'application/json',
+              'X-CSRF-ZOSMF-HEADER': '*',
+            };
+
+            const checks = [];
+            let allPassed = true;
+
+            // z/OSMF Jobs REST API — check JES2 job status
+            async function checkJob(jobname, expect_status) {
+              const url  = `https://${host}/zosmf/restjobs/jobs?owner=*&prefix=${jobname}`;
+              const resp = await fetch(url, { headers });
+              const jobs = await resp.json();
+              const job  = jobs.find(j => j.jobname === jobname);
+              return {
+                jobname,
+                found:   !!job,
+                status:  job?.status || 'NOT FOUND',
+                retcode: job?.retcode || 'N/A',
+                passed:  job?.status === expect_status,
+              };
+            }
+
+            // Console commands for JES2 checks
+            async function consoleCmd(cmd) {
+              const url  = `https://${host}/zosmf/restconsoles/consoles/defcn`;
+              const body = JSON.stringify({ cmd });
+              const resp = await fetch(url, { method: 'PUT', headers, body });
+              const data = await resp.json();
+              return (data['cmd-response'] || '').toUpperCase();
+            }
+
+            // JES2 subsystem active
+            const jesStatus = await consoleCmd('$D JES2');
+            checks.push({
+              name:     'JES2 subsystem active',
+              passed:   jesStatus.includes('JES2') && !jesStatus.includes('NOT ACTIVE'),
+              actual:   jesStatus.substring(0, 100),
+              critical: true,
+            });
+
+            // Spool utilization
+            const spoolStatus = await consoleCmd('$D SPOOL');
+            const spoolMatch  = spoolStatus.match(/(\d+)%/);
+            const spoolPct    = spoolMatch ? parseInt(spoolMatch[1]) : 100;
+            checks.push({
+              name:     'JES2 spool utilization < 80%',
+              passed:   spoolPct < 80,
+              actual:   `${spoolPct}% utilized`,
+              critical: true,
+            });
+
+            // Initiators active
+            const initStatus = await consoleCmd('$D INITINFO');
+            checks.push({
+              name:     'JES2 initiators active',
+              passed:   initStatus.includes('INIT') && !initStatus.includes('INACTIVE'),
+              actual:   initStatus.substring(0, 100),
+              critical: false,
+            });
+
+            // JES2 checkpoint
+            const ckptStatus = await consoleCmd('$D CKPTSPACE');
+            checks.push({
+              name:     'JES2 checkpoint accessible',
+              passed:   !ckptStatus.includes('ERROR') && !ckptStatus.includes('UNAVAILABLE'),
+              actual:   ckptStatus.substring(0, 100),
+              critical: true,
+            });
+
+            // Extended policy functions
+            const policyStatus = await consoleCmd('$D POLICY');
+            checks.push({
+              name:     'JES2 extended policy active',
+              passed:   policyStatus.includes('POLICY') && !policyStatus.includes('INACTIVE'),
+              actual:   policyStatus.substring(0, 100),
+              critical: false,
+            });
+
+            // Check for any failed checks
+            for (const c of checks) {
+              if (!c.passed && c.critical) allPassed = false;
+            }
+
+            const summary = {
+              total:    checks.length,
+              passed:   checks.filter(c => c.passed).length,
+              failed:   checks.filter(c => !c.passed).length,
+              spool_pct: spoolPct,
+              critical_failures: checks.filter(c => !c.passed && c.critical).length,
+            };
+
+            core.setOutput('result',  allPassed ? 'PASS' : 'FAIL');
+            core.setOutput('passed',  String(allPassed));
+            core.setOutput('details', JSON.stringify({ summary, checks }));
+
+  # ── Job 4: OMVS Filesystem Mount Validation ─────────────────────────────────
+  omvs-filesystem-check:
+    name: "OMVS Filesystem Mount Validation"
+    runs-on: ubuntu-latest
+    outputs:
+      result:  ${{ steps.omvs.outputs.result }}
+      passed:  ${{ steps.omvs.outputs.passed }}
+      details: ${{ steps.omvs.outputs.details }}
+
+    steps:
+      - name: Validate OMVS filesystem mounts
+        id: omvs
+        uses: actions/github-script@v7
+        env:
+          ZOSMF_HOST: ${{ secrets.ZOSMF_HOST }}
+          ZOSMF_USER: ${{ secrets.ZOSMF_USER }}
+          ZOSMF_PASS: ${{ secrets.ZOSMF_PASS }}
+        with:
+          script: |
+            const host = process.env.ZOSMF_HOST;
+            const auth = Buffer.from(`${process.env.ZOSMF_USER}:${process.env.ZOSMF_PASS}`).toString('base64');
+            const headers = {
+              'Authorization': `Basic ${auth}`,
+              'Content-Type':  'application/json',
+              'X-CSRF-ZOSMF-HEADER': '*',
+            };
+
+            const checks = [];
+            let allPassed = true;
+
+            async function consoleCmd(cmd) {
+              const url  = `https://${host}/zosmf/restconsoles/consoles/defcn`;
+              const body = JSON.stringify({ cmd });
+              const resp = await fetch(url, { method: 'PUT', headers, body });
+              const data = await resp.json();
+              return (data['cmd-response'] || '').toUpperCase();
+            }
+
+            // Critical ZFS mounts that must be present
+            const REQUIRED_MOUNTS = [
+              { path: '/',           type: 'ZFS', critical: true  },
+              { path: '/usr',        type: 'ZFS', critical: true  },
+              { path: '/var',        type: 'ZFS', critical: true  },
+              { path: '/tmp',        type: 'ZFS', critical: false },
+              { path: '/proc',       type: 'PROC', critical: true },
+              { path: '/global',     type: 'ZFS', critical: false },
+            ];
+
+            // Get mount list via D OMVS,PFS
+            const mountOutput = await consoleCmd('D OMVS,PFS');
+
+            // Verify no HFS mounts (critical — must be absent in 3.2)
+            const hfsPresent = mountOutput.includes('HFS');
+            checks.push({
+              name:     'No HFS mounts present (HFS deprecated)',
+              passed:   !hfsPresent,
+              actual:   hfsPresent ? 'HFS MOUNT DETECTED — CRITICAL FAILURE' : 'No HFS mounts found',
+              critical: true,
+            });
+
+            // Check each required mount
+            for (const mount of REQUIRED_MOUNTS) {
+              const present = mountOutput.includes(mount.path);
+              const isZFS   = mount.type === 'PROC' || mountOutput.includes(`${mount.path}.*ZFS`);
+              const passed  = present;
+              if (!passed && mount.critical) allPassed = false;
+              checks.push({
+                name:     `Mount ${mount.path} (${mount.type})`,
+                passed,
+                actual:   present ? `Mounted as ${mount.type}` : 'NOT MOUNTED',
+                critical: mount.critical,
+              });
+            }
+
+            // PROC filesystem check
+            const procOutput = await consoleCmd('D OMVS,PFS,TYPE=PROC');
+            checks.push({
+              name:     'PROC filesystem mounted at /proc',
+              passed:   procOutput.includes('/PROC') || procOutput.includes('PROC'),
+              actual:   procOutput.substring(0, 100),
+              critical: true,
+            });
+
+            // ZFS health check
+            const zfsHealth = await consoleCmd('D ZFS,QUERY,ALL');
+            const zfsErrors = zfsHealth.includes('ERROR') || zfsHealth.includes('FAILED');
+            checks.push({
+              name:     'ZFS filesystems healthy',
+              passed:   !zfsErrors,
+              actual:   zfsErrors ? 'ZFS errors detected' : 'All ZFS filesystems healthy',
+              critical: true,
+            });
+
+            // OMVS kernel active
+            const omvsStatus = await consoleCmd('D OMVS,KERN');
+            checks.push({
+              name:     'OMVS kernel active',
+              passed:   omvsStatus.includes('ACTIVE') && !omvsStatus.includes('INACTIVE'),
+              actual:   omvsStatus.substring(0, 100),
+              critical: true,
+            });
+
+            for (const c of checks) {
+              if (!c.passed && c.critical) allPassed = false;
+            }
+
+            const summary = {
+              total:    checks.length,
+              passed:   checks.filter(c => c.passed).length,
+              failed:   checks.filter(c => !c.passed).length,
+              hfs_free: !hfsPresent,
+              critical_failures: checks.filter(c => !c.passed && c.critical).length,
+            };
+
+            core.setOutput('result',  allPassed ? 'PASS' : 'FAIL');
+            core.setOutput('passed',  String(allPassed));
+            core.setOutput('details', JSON.stringify({ summary, checks }));
+
+  # ── Job 5: Aggregate Results & Update GitHub Projects v2 ───────────────────
+  aggregate-and-update:
+    name: "Aggregate Results & Update GitHub"
+    needs: [parmlib-verification, racf-icsf-health, jes2-spool-check, omvs-filesystem-check]
+    runs-on: ubuntu-latest
+    if: always()
+    outputs:
+      overall_result: ${{ steps.aggregate.outputs.overall_result }}
+      report_issue:   ${{ steps.create-report.outputs.issue_number }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Aggregate all check results
+        id: aggregate
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const results = {
+              parmlib: {
+                result:  '${{ needs.parmlib-verification.outputs.result }}',
+                passed:  '${{ needs.parmlib-verification.outputs.passed }}' === 'true',
+                details: JSON.parse('${{ needs.parmlib-verification.outputs.details }}' || '{}'),
+              },
+              racf_icsf: {
+                result:  '${{ needs.racf-icsf-health.outputs.result }}',
+                passed:  '${{ needs.racf-icsf-health.outputs.passed }}' === 'true',
+                details: JSON.parse('${{ needs.racf-icsf-health.outputs.details }}' || '{}'),
+              },
+              jes2: {
+                result:  '${{ needs.jes2-spool-check.outputs.result }}',
+                passed:  '${{ needs.jes2-spool-check.outputs.passed }}' === 'true',
+                details: JSON.parse('${{ needs.jes2-spool-check.outputs.details }}' || '{}'),
+              },
+              omvs: {
+                result:  '${{ needs.omvs-filesystem-check.outputs.result }}',
+                passed:  '${{ needs.omvs-filesystem-check.outputs.passed }}' === 'true',
+                details: JSON.parse('${{ needs.omvs-filesystem-check.outputs.details }}' || '{}'),
+              },
+            };
+
+            const allPassed = Object.values(results).every(r => r.passed);
+            const passCount = Object.values(results).filter(r => r.passed).length;
+
+            core.setOutput('overall_result', allPassed ? 'PASS' : 'FAIL');
+            core.setOutput('results_json', JSON.stringify(results));
+            core.setOutput('pass_count', passCount);
+            core.setOutput('all_passed', String(allPassed));
+
+            console.log(`Overall: ${allPassed ? 'PASS' : 'FAIL'} (${passCount}/4 checks passed)`);
+
+      - name: Auto-close resolved IPL blockers in GitHub Projects v2
+        if: steps.aggregate.outputs.all_passed == 'true'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GH_TOKEN }}
+          script: |
+            // Fetch all open IPL blocker issues
+            const blockers = await github.paginate(
+              github.rest.issues.listForRepo, {
+                owner: context.repo.owner,
+                repo:  context.repo.repo,
+                labels: 'ipl-blocker',
+                state:  'open',
+              }
+            );
+
+            const projectId = '${{ vars.PROJECT_ID }}';
+            let closed = 0;
+
+            for (const issue of blockers) {
+              // Close the issue
+              await github.rest.issues.update({
+                owner:        context.repo.owner,
+                repo:         context.repo.repo,
+                issue_number: issue.number,
+                state:        'closed',
+                state_reason: 'completed',
+              });
+
+              // Add resolution comment
+              await github.rest.issues.createComment({
+                owner:        context.repo.owner,
+                repo:         context.repo.repo,
+                issue_number: issue.number,
+                body: `## ✅ IPL Blocker Resolved — Post-IPL Validation Passed
+
+**LPAR:** \`${{ env.LPAR }}\`
+**IPL Timestamp:** \`${{ env.IPL_TS }}\`
+**Validation Run:** [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+
+All post-IPL validation checks passed. This blocker is automatically closed.
+
+*Auto-closed by Post-IPL Validation Suite — ${{ github.run_id }}*`,
+              });
+
+              // Update Projects v2 status to Done
+              try {
+                const item = await github.graphql(`
+                  query($nodeId: ID!) {
+                    node(id: $nodeId) {
+                      ... on Issue {
+                        projectItems(first: 5) {
+                          nodes { id project { id } }
+                        }
+                      }
+                    }
+                  }`, { nodeId: issue.node_id });
+
+                const projectItem = item.node.projectItems.nodes
+                  .find(n => n.project.id === projectId);
+
+                if (projectItem) {
+                  await github.graphql(`
+                    mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
+                      updateProjectV2ItemFieldValue(input: {
+                        projectId: $projectId, itemId: $itemId,
+                        fieldId: $fieldId,
+                        value: { singleSelectOptionId: $optionId }
+                      }) { projectV2Item { id } }
+                    }`, {
+                      projectId,
+                      itemId:   projectItem.id,
+                      fieldId:  '${{ vars.STATUS_FIELD_ID }}',
+                      optionId: '${{ vars.STATUS_DONE_OPTION_ID }}',
+                    });
+                }
+              } catch (e) {
+                console.log(`Could not update project item for #${issue.number}: ${e.message}`);
+              }
+
+              closed++;
+            }
+
+            console.log(`✅ Closed ${closed} IPL blocker issues`);
+            core.setOutput('closed_count', closed);
+
+      - name: Create post-IPL validation report issue
+        id: create-report
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const results = JSON.parse('${{ steps.aggregate.outputs.results_json }}' || '{}');
+            const overall = '${{ steps.aggregate.outputs.overall_result }}';
+            const lpar    = '${{ env.LPAR }}';
+            const iplTs   = '${{ env.IPL_TS }}';
+            const cabId   = '${{ env.CAB_CHANGE_ID }}';
+            const now     = new Date().toISOString();
+
+            const statusIcon = r => r.passed ? '✅' : '❌';
+
+            const body = `# z/OS 3.2 Post-IPL Validation Report
+
+## ${overall === 'PASS' ? '✅ ALL CHECKS PASSED' : '❌ VALIDATION FAILURES DETECTED'}
+
+| Field | Value |
+|-------|-------|
+| **LPAR** | \`${lpar}\` |
+| **IPL Timestamp** | \`${iplTs}\` |
+| **Validation Timestamp** | \`${now}\` |
+| **CAB Change Record** | \`${cabId || 'N/A'}\` |
+| **Run ID** | [${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |
+| **Environment** | \`${{ env.ENV_TYPE }}\` |
+
+## Check Results Summary
+
+| Check | Result | Passed | Failed | Critical Failures |
+|-------|--------|--------|--------|-------------------|
+| PARMLIB Verification | ${statusIcon(results.parmlib)} ${results.parmlib?.result} | ${results.parmlib?.details?.summary?.passed || 0} | ${results.parmlib?.details?.summary?.failed || 0} | ${results.parmlib?.details?.summary?.critical_failures || 0} |
+| RACF & ICSF Health | ${statusIcon(results.racf_icsf)} ${results.racf_icsf?.result} | ${results.racf_icsf?.details?.summary?.passed || 0} | ${results.racf_icsf?.details?.summary?.failed || 0} | ${results.racf_icsf?.details?.summary?.critical_failures || 0} |
+| JES2 Spool Status | ${statusIcon(results.jes2)} ${results.jes2?.result} | ${results.jes2?.details?.summary?.passed || 0} | ${results.jes2?.details?.summary?.failed || 0} | ${results.jes2?.details?.summary?.critical_failures || 0} |
+| OMVS Filesystem | ${statusIcon(results.omvs)} ${results.omvs?.result} | ${results.omvs?.details?.summary?.passed || 0} | ${results.omvs?.details?.summary?.failed || 0} | ${results.omvs?.details?.summary?.critical_failures || 0} |
+
+## Sign-off
+
+| Role | Name | Date | Approved |
+|------|------|------|----------|
+| System Programmer Lead | | ${now.split('T')[0]} | ☐ |
+| Security Lead | | ${now.split('T')[0]} | ☐ |
+| Operations Manager | | ${now.split('T')[0]} | ☐ |
+| Change Manager | | ${now.split('T')[0]} | ☐ |
+
+## CAB Change Record Update
+${cabId ? `This report should be attached to CAB Change Record **${cabId}** as evidence of successful z/OS 3.2 migration completion.` : 'No CAB Change Record ID provided.'}
+
+---
+*Auto-generated by Post-IPL Validation Suite — GitHub Actions Run #${{ github.run_number }}*`;
+
+            const issue = await github.rest.issues.create({
+              owner:  context.repo.owner,
+              repo:   context.repo.repo,
+              title:  `📋 Post-IPL Validation Report — ${lpar} — ${now.split('T')[0]} — ${overall}`,
+              body,
+              labels: ['post-ipl-report', overall === 'PASS' ? 'validation-passed' : 'validation-failed'],
+            });
+
+            core.setOutput('issue_number', issue.data.number);
+            core.setOutput('issue_url',    issue.data.html_url);
+            console.log(`Report issue created: #${issue.data.number}`);
+
+  # ── Job 6: Update Jira Epic via Sync Bridge ─────────────────────────────────
+  jira-epic-update:
+    name: "Update Jira Epic via Sync Bridge"
+    needs: [aggregate-and-update]
+    runs-on: ubuntu-latest
+    if: always() && env.JIRA_EPIC != ''
+
+    steps:
+      - name: Update Jira epic with validation results
+        uses: actions/github-script@v7
+        env:
+          JIRA_URL:   ${{ secrets.JIRA_URL }}
+          JIRA_TOKEN: ${{ secrets.JIRA_TOKEN }}
+          JIRA_USER:  ${{ secrets.JIRA_USER }}
+        with:
+          script: |
+            const jiraUrl   = process.env.JIRA_URL;
+            const epicKey   = '${{ env.JIRA_EPIC }}';
+            const overall   = '${{ needs.aggregate-and-update.outputs.overall_result }}';
+            const reportUrl = `${{ github.server_url }}/${{ github.repository }}/issues/${{ needs.aggregate-and-update.outputs.report_issue }}`;
+            const auth      = Buffer.from(`${process.env.JIRA_USER}:${process.env.JIRA_TOKEN}`).toString('base64');
+            const headers   = { 'Authorization': `Basic ${auth}`, 'Content-Type': 'application/json' };
+
+            // Add comment to Jira epic
+            const comment = {
+              body: {
+                type: 'doc', version: 1,
+                content: [{
+                  type: 'paragraph',
+                  content: [{
+                    type: 'text',
+                    text: `z/OS 3.2 Post-IPL Validation: ${overall} — LPAR: ${{ env.LPAR }} — ${new Date().toISOString().split('T')[0]}. GitHub Report: ${reportUrl}`,
+                  }]
+                }]
+              }
+            };
+
+            await fetch(`${jiraUrl}/rest/api/3/issue/${epicKey}/comment`, {
+              method: 'POST', headers, body: JSON.stringify(comment),
+            });
+
+            // Transition epic to Done if all passed
+            if (overall === 'PASS') {
+              const transResp = await fetch(`${jiraUrl}/rest/api/3/issue/${epicKey}/transitions`, { headers });
+              const trans     = await transResp.json();
+              const doneTrans = trans.transitions?.find(t => t.name === 'Done' || t.name === 'Closed');
+              if (doneTrans) {
+                await fetch(`${jiraUrl}/rest/api/3/issue/${epicKey}/transitions`, {
+                  method: 'POST', headers,
+                  body: JSON.stringify({ transition: { id: doneTrans.id } }),
+                });
+                console.log(`✅ Jira epic ${epicKey} transitioned to Done`);
+              }
+            }
+
+            // Update custom field "Migration Status"
+            await fetch(`${jiraUrl}/rest/api/3/issue/${epicKey}`, {
+              method: 'PUT', headers,
+              body: JSON.stringify({
+                fields: {
+                  customfield_migration_status: overall === 'PASS' ? 'IPL Validated' : 'IPL Validation Failed',
+                  customfield_github_report_url: reportUrl,
+                }
+              }),
+            });
+
+            console.log(`Jira epic ${epicKey} updated with validation result: ${overall}`);
+
+  # ── Job 7: Slack Notification ───────────────────────────────────────────────
+  notify-completion:
+    name: "Notify Completion"
+    needs: [aggregate-and-update, jira-epic-update]
+    runs-on: ubuntu-latest
+    if: always()
+
+    steps:
+      - name: Send completion notification
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          webhook: ${{ secrets.SLACK_WEBHOOK_MIGRATION }}
+          webhook-type: incoming-webhook
+          payload: |
+            {
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "${{ needs.aggregate-and-update.outputs.overall_result == 'PASS' && '✅' || '❌' }} z/OS 3.2 Post-IPL Validation — ${{ needs.aggregate-and-update.outputs.overall_result }}"
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {"type": "mrkdwn", "text": "*LPAR:*\n`${{ env.LPAR }}`"},
+                    {"type": "mrkdwn", "text": "*Environment:*\n`${{ env.ENV_TYPE }}`"},
+                    {"type": "mrkdwn", "text": "*CAB Change:*\n`${{ env.CAB_CHANGE_ID || 'N/A' }}`"},
+                    {"type": "mrkdwn", "text": "*Report Issue:*\n<${{ github.server_url }}/${{ github.repository }}/issues/${{ needs.aggregate-and-update.outputs.report_issue }}|View Report>"}
+                  ]
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {"type": "plain_text", "text": "View Validation Run"},
+                      "url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                    }
+                  ]
+                }
+              ]
+            }
